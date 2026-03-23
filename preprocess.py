@@ -1,428 +1,252 @@
 from __future__ import annotations
 
 """
-Preprocess audio and EEG data in a way that closely follows the Fuglsang
-selective-attention pipeline shown by the user.
+Unified Fuglsang-style preprocessing runner.
 
-This script is a practical Python approximation of the MATLAB processing chain:
+This script organizes outputs into a single `data/` folder with two subfolders:
 
-Audio (raw audio version)
--------------------------
-average -> lowpass 6000 Hz -> resample 12 kHz -> gammatone/ERB filterbank
--> full-wave rectify / Hilbert envelope -> power-law compression (0.3)
--> average across bands -> lowpass 30 Hz -> resample 64 Hz
--> highpass 1 Hz -> lowpass 9 Hz
+    data/
+      example1/
+        preprocessed.npz
+        preprocessed.mat   (optional)
+      example2_mtrf/
+        preprocessed.npz
+        preprocessed.mat   (optional)
 
-Audio (derived-envelope version)
---------------------------------
-If the raw audio is not available, the script can start from a derived envelope
-sampled at 512 Hz and then apply:
-lowpass 30 Hz -> resample 64 Hz -> highpass 1 Hz -> lowpass 9 Hz
+It wraps the two earlier preprocessing implementations:
+- fuglsang_preprocess.py          -> example1-style feature tensors
+- fuglsang_preprocess_mtrf.py     -> example2 / mTRF-style trial lists
 
-EEG
----
-raw -> rereference to mastoids -> lowpass 30 Hz -> resample 64 Hz
--> EOG regression denoising (optional) -> highpass 1 Hz -> lowpass 9 Hz
--> crop time-of-interest
+Typical use
+-----------
+python fuglsang_preprocess_dataset.py \
+    --bidsdir /path/to/ds-eeg-nhhi \
+    --subject 1 \
+    --data-dir ./data \
+    --save-mat
 
-Important note
---------------
-The original MATLAB functions used in Fuglsang's dataset codebase
-(build_aud_features, build_eeg_features, and the exact FieldTrip helpers) are
-not available here. Therefore, this script reproduces the *reported signal
-processing logic* and the preprocessing sequence from the example script, but it
-cannot guarantee bit-identical outputs.
-
-References used for this approximation:
-- Fuglsang et al. describe speech features as ERB/gammatone-like subband
-  envelopes, Hilbert envelope extraction, power-law compression with exponent
-  0.3, and final low-pass filtering/averaging across filters.
-- They also describe EEG preprocessing with mastoid rereferencing, artifact
-  cleaning, and a final low-frequency band emphasizing the delta/theta range.
+Notes
+-----
+- This script creates ONE preprocessed file inside each folder.
+- For example1, it builds an `srdat`-like structure for a single subject:
+    target_st, target_tt, masker_tt, eeg_st, eeg_tt
+- For example2, it stores mTRF-ready trial arrays for the same subject.
+- This is a practical Python approximation of the MATLAB pipelines.
 """
 
 import argparse
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any
 
-import mne
 import numpy as np
-import soundfile as sf
+import pandas as pd
 from scipy.io import savemat
-from scipy.signal import butter, filtfilt, hilbert, resample_poly
 
-try:
-    from gammatone.filters import centre_freqs, make_erb_filters, erb_filterbank
-    HAVE_GAMMATONE = True
-except Exception:
-    HAVE_GAMMATONE = False
+# Import the two earlier scripts as modules.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-
-# -----------------------------------------------------------------------------
-# Signal utilities
-# -----------------------------------------------------------------------------
-
-
-def _ensure_2d_audio(x: np.ndarray) -> np.ndarray:
-    """Return audio as shape (samples, channels)."""
-    x = np.asarray(x)
-    if x.ndim == 1:
-        return x[:, None]
-    if x.ndim == 2:
-        return x
-    raise ValueError(f"Audio must be 1D or 2D, got shape={x.shape}")
-
-
-
-def _as_float64(x: np.ndarray) -> np.ndarray:
-    return np.asarray(x, dtype=np.float64)
-
-
-
-def _butter_filter(
-    x: np.ndarray,
-    fs: float,
-    *,
-    low: float | None = None,
-    high: float | None = None,
-    order: int = 4,
-    axis: int = 0,
-) -> np.ndarray:
-    nyq = fs / 2.0
-    if low is not None and high is not None:
-        btype = "band"
-        wn = [low / nyq, high / nyq]
-    elif low is not None:
-        btype = "high"
-        wn = low / nyq
-    elif high is not None:
-        btype = "low"
-        wn = high / nyq
-    else:
-        raise ValueError("At least one of low/high must be specified")
-
-    b, a = butter(order, wn, btype=btype)
-    return filtfilt(b, a, x, axis=axis)
-
-
-
-def _resample(x: np.ndarray, fs_in: float, fs_out: float, axis: int = 0) -> np.ndarray:
-    if fs_in == fs_out:
-        return np.asarray(x)
-    # Rational approximation robust enough for standard sampling rates.
-    from fractions import Fraction
-
-    ratio = Fraction(fs_out / fs_in).limit_denominator(1000)
-    up, down = ratio.numerator, ratio.denominator
-    return resample_poly(x, up, down, axis=axis)
-
-
-
-def _average_channels(x: np.ndarray) -> np.ndarray:
-    x = _ensure_2d_audio(x)
-    return x.mean(axis=1)
-
-
-
-def _full_wave_rectify(x: np.ndarray) -> np.ndarray:
-    return np.abs(x)
-
-
-
-def _hilbert_envelope(x: np.ndarray, axis: int = 0) -> np.ndarray:
-    return np.abs(hilbert(x, axis=axis))
+import fuglsang_preprocess as ex1
+import fuglsang_preprocess_mtrf as ex2
 
 
 # -----------------------------------------------------------------------------
-# Audio feature extraction
+# Small helpers
 # -----------------------------------------------------------------------------
 
 
-@dataclass
-class AudioConfig:
-    fs_lowpass_1: float = 6000.0
-    fs_resample_1: float = 12000.0
-    n_bands: int = 28
-    f_min: float = 150.0
-    f_max: float = 8000.0
-    compression: float = 0.3
-    fs_lowpass_2: float = 30.0
-    fs_mid: float = 512.0
-    fs_out: float = 64.0
-    hp_out: float = 1.0
-    lp_out: float = 9.0
-    filt_order: int = 4
+def _jsonable(obj: Any) -> Any:
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return str(obj)
 
 
 
-def erb_envelope_feature(
-    audio: np.ndarray,
-    fs: float,
-    cfg: AudioConfig,
-) -> tuple[np.ndarray, dict]:
-    """
-    Extract Fuglsang-style broadband envelope from raw audio.
+def _save_npz_and_optional_mat(out_base: Path, payload: dict[str, Any], save_mat: bool) -> None:
+    out_base.parent.mkdir(parents=True, exist_ok=True)
 
-    Returns
-    -------
-    env : ndarray, shape (samples_out,)
-        Final envelope sampled at cfg.fs_out.
-    info : dict
-        Metadata about the processing steps.
-    """
-    audio = _ensure_2d_audio(audio)
-    mono = _average_channels(audio)
-
-    # MATLAB-like preprocessing chain from the provided script.
-    mono = _butter_filter(mono, fs, high=cfg.fs_lowpass_1, order=cfg.filt_order)
-    mono = _resample(mono, fs, cfg.fs_resample_1)
-    fs1 = cfg.fs_resample_1
-
-    if not HAVE_GAMMATONE:
-        raise ImportError(
-            "gammatone package is not installed. Install `gammatone` to use raw "
-            "audio feature extraction, or start from derived envelopes with "
-            "--derived-envelope."
-        )
-
-    cfs = centre_freqs(cfg.fs_resample_1, cfg.n_bands, cfg.f_min)
-    cfs = cfs[(cfs >= cfg.f_min) & (cfs <= cfg.f_max)]
-    fcoefs = make_erb_filters(fs1, cfs)
-    bands = erb_filterbank(mono, fcoefs)  # shape: (bands, samples)
-
-    # User's MATLAB chain lists full-wave rectify; the paper describes Hilbert.
-    # We use Hilbert envelopes because that is the more explicit method reported.
-    env_bands = _hilbert_envelope(bands, axis=1)
-    env_bands = env_bands ** cfg.compression
-
-    # Average across bands *after* extracting/compressing narrowband envelopes.
-    broadband = env_bands.mean(axis=0)
-
-    # Match the MATLAB-style later envelope processing.
-    broadband = _butter_filter(broadband, fs1, high=cfg.fs_lowpass_2, order=cfg.filt_order)
-    broadband = _resample(broadband, fs1, cfg.fs_mid)
-    broadband = _butter_filter(broadband, cfg.fs_mid, low=cfg.hp_out, order=cfg.filt_order)
-    broadband = _butter_filter(broadband, cfg.fs_mid, high=cfg.lp_out, order=cfg.filt_order)
-    broadband = _resample(broadband, cfg.fs_mid, cfg.fs_out)
-
-    info = {
-        "input_fs": fs,
-        "mono": True,
-        "fs_after_first_resample": cfg.fs_resample_1,
-        "fs_after_second_resample": cfg.fs_mid,
-        "fs_out": cfg.fs_out,
-        "n_bands": int(len(cfs)),
-        "band_centers_hz": cfs.tolist(),
-        "compression": cfg.compression,
-        "processing": [
-            "average_channels",
-            f"lowpass_{cfg.fs_lowpass_1}",
-            f"resample_{cfg.fs_resample_1}",
-            "erb_filterbank",
-            "hilbert_envelope",
-            f"powerlaw_{cfg.compression}",
-            "average_bands",
-            f"lowpass_{cfg.fs_lowpass_2}",
-            f"resample_{cfg.fs_mid}",
-            f"highpass_{cfg.hp_out}",
-            f"lowpass_{cfg.lp_out}",
-            f"resample_{cfg.fs_out}",
-        ],
-    }
-    return _as_float64(broadband), info
-
-
-
-def preprocess_derived_envelope(
-    env_512: np.ndarray,
-    fs_in: float,
-    cfg: AudioConfig,
-) -> tuple[np.ndarray, dict]:
-    """Process already-derived envelope features, like the Zenodo derivatives."""
-    x = np.asarray(env_512).squeeze()
-    if x.ndim != 1:
-        raise ValueError("Derived envelope must be one-dimensional after squeeze().")
-
-    x = _butter_filter(x, fs_in, high=cfg.fs_lowpass_2, order=cfg.filt_order)
-    x = _resample(x, fs_in, cfg.fs_out)
-    x = _butter_filter(x, cfg.fs_out, low=cfg.hp_out, order=cfg.filt_order)
-    x = _butter_filter(x, cfg.fs_out, high=cfg.lp_out, order=cfg.filt_order)
-
-    info = {
-        "input_fs": fs_in,
-        "fs_out": cfg.fs_out,
-        "processing": [
-            f"lowpass_{cfg.fs_lowpass_2}",
-            f"resample_{cfg.fs_out}",
-            f"highpass_{cfg.hp_out}",
-            f"lowpass_{cfg.lp_out}",
-        ],
-    }
-    return _as_float64(x), info
-
-
-# -----------------------------------------------------------------------------
-# EEG preprocessing
-# -----------------------------------------------------------------------------
-
-
-@dataclass
-class EEGConfig:
-    lowpass_30_before_resample: float = 30.0
-    resample_to: float = 64.0
-    highpass_final: float = 1.0
-    lowpass_final: float = 9.0
-    eog_regression: bool = True
-    crop_tmin: float | None = None
-    crop_tmax: float | None = None
-
-
-
-def _load_raw_eeg(path: Path, preload: bool = True) -> mne.io.BaseRaw:
-    suffix = path.suffix.lower()
-    if suffix == ".fif":
-        return mne.io.read_raw_fif(path, preload=preload, verbose="ERROR")
-    if suffix == ".edf":
-        return mne.io.read_raw_edf(path, preload=preload, verbose="ERROR")
-    if suffix == ".bdf":
-        return mne.io.read_raw_bdf(path, preload=preload, verbose="ERROR")
-    if suffix == ".vhdr":
-        return mne.io.read_raw_brainvision(path, preload=preload, verbose="ERROR")
-    if suffix == ".set":
-        return mne.io.read_raw_eeglab(path, preload=preload, verbose="ERROR")
-    raise ValueError(
-        f"Unsupported EEG format '{suffix}'. Supported: .fif, .edf, .bdf, .vhdr, .set"
-    )
-
-
-
-def _apply_mastoid_reference(raw: mne.io.BaseRaw, mastoids: Sequence[str] | None) -> mne.io.BaseRaw:
-    if mastoids:
-        missing = [ch for ch in mastoids if ch not in raw.ch_names]
-        if missing:
-            raise ValueError(f"Mastoid channels not found: {missing}")
-        raw = raw.copy().set_eeg_reference(ref_channels=list(mastoids), verbose="ERROR")
-    return raw
-
-
-
-def _run_eog_regression(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
-    raw = raw.copy()
-    eog_picks = mne.pick_types(raw.info, eog=True)
-    eeg_picks = mne.pick_types(raw.info, eeg=True, eog=False)
-    if len(eog_picks) == 0 or len(eeg_picks) == 0:
-        return raw
-
-    data = raw.get_data()
-    X = data[eog_picks].T  # (time, n_eog)
-    X = np.column_stack([X, np.ones(len(X))])
-
-    for pick in eeg_picks:
-        y = data[pick]
-        beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-        y_hat = X[:, :-1] @ beta[:-1] + beta[-1]
-        data[pick] = y - y_hat
-
-    raw._data = data
-    return raw
-
-
-
-def preprocess_eeg(
-    eeg_path: Path,
-    cfg: EEGConfig,
-    mastoids: Sequence[str] | None = None,
-) -> tuple[np.ndarray, float, dict]:
-    """
-    Return EEG as (time, channels) after Fuglsang-like preprocessing.
-    """
-    raw = _load_raw_eeg(eeg_path)
-    original_fs = float(raw.info["sfreq"])
-
-    raw = _apply_mastoid_reference(raw, mastoids)
-
-    # MATLAB example script first low-pass filters at 30 Hz, then resamples to 64 Hz.
-    raw.filter(
-        l_freq=None,
-        h_freq=cfg.lowpass_30_before_resample,
-        method="iir",
-        phase="zero",
-        verbose="ERROR",
-    )
-    raw.resample(cfg.resample_to, verbose="ERROR")
-
-    if cfg.eog_regression:
-        raw = _run_eog_regression(raw)
-
-    raw.filter(
-        l_freq=cfg.highpass_final,
-        h_freq=None,
-        method="iir",
-        phase="zero",
-        verbose="ERROR",
-    )
-    raw.filter(
-        l_freq=None,
-        h_freq=cfg.lowpass_final,
-        method="iir",
-        phase="zero",
-        verbose="ERROR",
-    )
-
-    if cfg.crop_tmin is not None or cfg.crop_tmax is not None:
-        raw.crop(tmin=cfg.crop_tmin or 0.0, tmax=cfg.crop_tmax, include_tmax=False)
-
-    eeg_picks = mne.pick_types(raw.info, eeg=True, eog=False)
-    eeg = raw.get_data(picks=eeg_picks).T  # (time, channels)
-    ch_names = [raw.ch_names[i] for i in eeg_picks]
-
-    info = {
-        "input_fs": original_fs,
-        "fs_out": cfg.resample_to,
-        "n_channels": len(ch_names),
-        "channels": ch_names,
-        "mastoids": list(mastoids) if mastoids else None,
-        "eog_regression": cfg.eog_regression,
-        "crop_tmin": cfg.crop_tmin,
-        "crop_tmax": cfg.crop_tmax,
-        "processing": [
-            "reref_mastoids" if mastoids else "reference_unchanged",
-            f"lowpass_{cfg.lowpass_30_before_resample}",
-            f"resample_{cfg.resample_to}",
-            "eog_regression" if cfg.eog_regression else "no_eog_regression",
-            f"highpass_{cfg.highpass_final}",
-            f"lowpass_{cfg.lowpass_final}",
-        ],
-    }
-    return _as_float64(eeg), float(cfg.resample_to), info
-
-
-# -----------------------------------------------------------------------------
-# Trial struct assembly
-# -----------------------------------------------------------------------------
-
-
-
-def stack_trials_3d(arrays: Sequence[np.ndarray]) -> np.ndarray:
-    """Stack equal-length arrays into (time, features, trials)."""
-    if not arrays:
-        raise ValueError("No arrays supplied")
-    arrays = [np.asarray(a) for a in arrays]
-    lengths = {a.shape[0] for a in arrays}
-    if len(lengths) != 1:
-        raise ValueError(f"All trials must have equal length, got lengths={sorted(lengths)}")
-
-    fixed = []
-    for a in arrays:
-        if a.ndim == 1:
-            fixed.append(a[:, None])
-        elif a.ndim == 2:
-            fixed.append(a)
+    npz_payload: dict[str, Any] = {}
+    mat_payload: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, (dict, list)):
+            npz_payload[key] = np.array(json.dumps(_jsonable(value)), dtype=object)
+            mat_payload[key] = json.dumps(_jsonable(value))
         else:
-            raise ValueError(f"Each trial must be 1D or 2D, got shape={a.shape}")
-    return np.stack(fixed, axis=2)
+            npz_payload[key] = value
+            mat_payload[key] = value
+
+    np.savez(out_base.with_suffix(".npz"), **npz_payload)
+    if save_mat:
+        savemat(out_base.with_suffix(".mat"), mat_payload, do_compression=True)
+
+
+
+def _load_participants(bidsdir: Path) -> pd.DataFrame | None:
+    p = bidsdir / "participants.tsv"
+    return pd.read_csv(p, sep="\t") if p.exists() else None
+
+
+# -----------------------------------------------------------------------------
+# Example 1 builder: create srdat-like arrays for one subject
+# -----------------------------------------------------------------------------
+
+
+def build_example1_subject(bidsdir: Path, subject: int) -> dict[str, Any]:
+    audio_cfg = ex1.AudioConfig()
+    eeg_cfg = ex1.EEGConfig(
+        eog_regression=True,
+        crop_tmin=6.0,
+        crop_tmax=43.0,
+    )
+
+    participants = _load_participants(bidsdir)
+    sub = f"sub-{subject:03d}"
+    eeg_dir = bidsdir / sub / "eeg"
+
+    run_specs: list[tuple[Path, Path]] = [
+        (
+            eeg_dir / f"{sub}_task-selectiveattention_eeg.bdf",
+            eeg_dir / f"{sub}_task-selectiveattention_events.tsv",
+        )
+    ]
+    run2_bdf = eeg_dir / f"{sub}_task-selectiveattention_run-2_eeg.bdf"
+    run2_evt = eeg_dir / f"{sub}_task-selectiveattention_run-2_events.tsv"
+    if run2_bdf.exists() and run2_evt.exists():
+        run_specs.append((run2_bdf, run2_evt))
+
+    hearing_status = None
+    if participants is not None and "participant_id" in participants.columns:
+        row = participants.loc[participants["participant_id"] == sub]
+        if len(row) and "hearing_status" in row.columns:
+            hearing_status = row.iloc[0]["hearing_status"]
+
+    target_st_trials: list[np.ndarray] = []
+    target_tt_trials: list[np.ndarray] = []
+    masker_tt_trials: list[np.ndarray] = []
+    eeg_st_trials: list[np.ndarray] = []
+    eeg_tt_trials: list[np.ndarray] = []
+    trial_meta: list[dict[str, Any]] = []
+
+    for eeg_path, events_path in run_specs:
+        eeg_trials, eeg_meta = ex2.preprocess_eeg_run(eeg_path, events_path, ex2.EEGConfig())
+        wav_specs = ex2.collect_wav_files_for_run(bidsdir, events_path, hearing_status)
+
+        if len(eeg_trials) != len(wav_specs):
+            raise ValueError(
+                f"Mismatch for {sub} {eeg_path.name}: {len(eeg_trials)} EEG trials vs {len(wav_specs)} audio trials"
+            )
+
+        for eeg_trial, eeg_info, wav_spec in zip(eeg_trials, eeg_meta, wav_specs):
+            # Audio processing using the richer example1-style front-end.
+            import soundfile as sf
+            wav_t, fs_t = sf.read(wav_spec["target_path"])
+            feat_t, _ = ex1.erb_envelope_feature(wav_t, fs_t, audio_cfg)
+
+            feat_m = None
+            if wav_spec["masker_path"] is not None:
+                wav_m, fs_m = sf.read(wav_spec["masker_path"])
+                if fs_m != fs_t:
+                    raise ValueError("Target and masker sampling rates differ within trial")
+                wav_m = ex2.pad_masker_with_silence(wav_m, fs_m, wav_spec["masker_delay_sec"] or 0.0)
+                feat_m, _ = ex1.erb_envelope_feature(wav_m, fs_m, audio_cfg)
+
+            # Align to common sample count after preprocessing.
+            lengths = [eeg_trial.shape[0], len(feat_t)]
+            if feat_m is not None:
+                lengths.append(len(feat_m))
+            n = min(lengths)
+
+            eeg_trial = eeg_trial[:n]
+            feat_t = feat_t[:n]
+            if feat_m is not None:
+                feat_m = feat_m[:n]
+
+            if feat_m is None:
+                target_st_trials.append(feat_t)
+                eeg_st_trials.append(eeg_trial)
+                trial_kind = "singletalker"
+            else:
+                target_tt_trials.append(feat_t)
+                masker_tt_trials.append(feat_m)
+                eeg_tt_trials.append(eeg_trial)
+                trial_kind = "twotalker"
+
+            trial_meta.append({
+                "subject": sub,
+                "trial_kind": trial_kind,
+                "target_path": wav_spec["target_path"],
+                "masker_path": wav_spec["masker_path"],
+                "masker_delay_sec": wav_spec["masker_delay_sec"],
+                "aligned_samples": int(n),
+                "eeg_info": eeg_info,
+            })
+
+    result = {
+        "meta": {
+            "subject": sub,
+            "hearing_status": hearing_status,
+            "audio_config": asdict(audio_cfg),
+            "eeg_config": asdict(eeg_cfg),
+            "notes": [
+                "Approximation of examplescript1.m",
+                "Arrays are organized to resemble srdat",
+                "audio arrays are (time, features, trials)",
+                "eeg arrays are (time, channels, trials)",
+            ],
+        },
+        "target_st": ex1.stack_trials_3d(target_st_trials) if target_st_trials else np.empty((0, 0, 0)),
+        "target_tt": ex1.stack_trials_3d(target_tt_trials) if target_tt_trials else np.empty((0, 0, 0)),
+        "masker_tt": ex1.stack_trials_3d(masker_tt_trials) if masker_tt_trials else np.empty((0, 0, 0)),
+        "eeg_st": ex1.stack_trials_3d(eeg_st_trials) if eeg_st_trials else np.empty((0, 0, 0)),
+        "eeg_tt": ex1.stack_trials_3d(eeg_tt_trials) if eeg_tt_trials else np.empty((0, 0, 0)),
+        "fs_audio": audio_cfg.fs_out,
+        "fs_eeg": ex2.EEGConfig().fs_out,
+        "trial_meta": trial_meta,
+    }
+    return result
+
+
+# -----------------------------------------------------------------------------
+# Example 2 builder: create one mTRF file for one subject
+# -----------------------------------------------------------------------------
+
+
+def build_example2_subject(bidsdir: Path, subject: int) -> dict[str, Any]:
+    participants = _load_participants(bidsdir)
+    audio_cfg = ex2.AudioConfig()
+    eeg_cfg = ex2.EEGConfig()
+    result = ex2.process_subject(bidsdir, subject, audio_cfg, eeg_cfg, participants)
+    return {
+        "meta": {
+            "subject": result["subject"],
+            "hearing_status": result["hearing_status"],
+            "audio_config": asdict(audio_cfg),
+            "eeg_config": asdict(eeg_cfg),
+            "notes": [
+                "Approximation of examplescript2.m",
+                "mTRF-ready per-trial data",
+                "stim_* arrays are object arrays of shape (n_trials,)",
+                "resp_* arrays are object arrays of shape (n_trials,) with each trial shaped (time, channels)",
+            ],
+        },
+        "stim_st": result["stim_st"],
+        "resp_st": result["resp_st"],
+        "stim_att": result["stim_att"],
+        "stim_itt": result["stim_itt"],
+        "resp_tt": result["resp_tt"],
+        "eeg_meta": result["eeg_meta"],
+        "audio_meta": result["audio_meta"],
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -430,135 +254,37 @@ def stack_trials_3d(arrays: Sequence[np.ndarray]) -> np.ndarray:
 # -----------------------------------------------------------------------------
 
 
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fuglsang-style preprocessing for audio and EEG.")
-
-    p.add_argument("--audio", type=Path, nargs="*", default=None, help="Raw audio file(s), one per trial.")
-    p.add_argument(
-        "--derived-envelope",
-        type=Path,
-        nargs="*",
-        default=None,
-        help="Envelope file(s) instead of raw audio. Supported: .npy, .npz, .txt, .csv.",
-    )
-    p.add_argument("--eeg", type=Path, nargs="*", default=None, help="Raw EEG file(s), one per trial or recording.")
-    p.add_argument("--out", type=Path, required=True, help="Output .npz or .mat file.")
-    p.add_argument("--audio-key", type=str, default=None, help="Key to read from .npz derived envelope files.")
-    p.add_argument("--derived-fs", type=float, default=512.0, help="Sampling rate of derived envelopes.")
-    p.add_argument("--mastoids", nargs="*", default=["M1", "M2"], help="Mastoid channel names for rereferencing.")
-    p.add_argument("--crop-tmin", type=float, default=None, help="Crop EEG start time in seconds.")
-    p.add_argument("--crop-tmax", type=float, default=None, help="Crop EEG end time in seconds.")
-    p.add_argument("--no-eog-regression", action="store_true", help="Disable simple EOG regression denoising.")
-    p.add_argument("--save-mat", action="store_true", help="Also save MATLAB .mat alongside the .npz output.")
+    p = argparse.ArgumentParser(description="Create organized Fuglsang preprocessing outputs in data/example1 and data/example2_mtrf")
+    p.add_argument("--bidsdir", type=Path, required=True, help="Path to ds-eeg-nhhi BIDS root")
+    p.add_argument("--subject", type=int, required=True, help="Single subject ID, e.g. 1")
+    p.add_argument("--data-dir", type=Path, default=Path("data"), help="Root output folder")
+    p.add_argument("--mode", choices=["all", "example1", "example2"], default="all")
+    p.add_argument("--save-mat", action="store_true", help="Also save .mat files")
     return p.parse_args()
-
-
-
-def _load_derived_env(path: Path, key: str | None) -> np.ndarray:
-    suffix = path.suffix.lower()
-    if suffix == ".npy":
-        return np.load(path)
-    if suffix == ".npz":
-        z = np.load(path)
-        if key is None:
-            if len(z.files) != 1:
-                raise ValueError(f"{path} has multiple arrays; specify --audio-key.")
-            key = z.files[0]
-        return z[key]
-    if suffix in {".txt", ".csv"}:
-        return np.loadtxt(path, delimiter="," if suffix == ".csv" else None)
-    raise ValueError(f"Unsupported derived-envelope format: {suffix}")
 
 
 
 def main() -> None:
     args = parse_args()
-    audio_cfg = AudioConfig()
-    eeg_cfg = EEGConfig(
-        eog_regression=not args.no_eog_regression,
-        crop_tmin=args.crop_tmin,
-        crop_tmax=args.crop_tmax,
-    )
+    data_dir = args.data_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    out = args.out
-    out.parent.mkdir(parents=True, exist_ok=True)
+    if args.mode in {"all", "example1"}:
+        out1 = data_dir / "example1" / "preprocessed"
+        payload1 = build_example1_subject(args.bidsdir, args.subject)
+        _save_npz_and_optional_mat(out1, payload1, args.save_mat)
+        print(f"Saved: {out1.with_suffix('.npz')}")
+        if args.save_mat:
+            print(f"Saved: {out1.with_suffix('.mat')}")
 
-    result: dict[str, object] = {
-        "meta": {
-            "audio_config": asdict(audio_cfg),
-            "eeg_config": asdict(eeg_cfg),
-            "notes": [
-                "Python approximation of Fuglsang-style preprocessing",
-                "not guaranteed to be numerically identical to the original MATLAB code",
-            ],
-        }
-    }
-
-    # Audio trials
-    audio_trials = []
-    audio_infos = []
-    if args.audio:
-        for path in args.audio:
-            wav, fs = sf.read(path)
-            feat, info = erb_envelope_feature(wav, fs, audio_cfg)
-            audio_trials.append(feat)
-            info["source"] = str(path)
-            audio_infos.append(info)
-        result["aud_feature"] = stack_trials_3d(audio_trials)
-        result["aud_fs"] = audio_cfg.fs_out
-        result["aud_info"] = audio_infos
-
-    elif args.derived_envelope:
-        for path in args.derived_envelope:
-            env = _load_derived_env(path, args.audio_key)
-            feat, info = preprocess_derived_envelope(env, args.derived_fs, audio_cfg)
-            audio_trials.append(feat)
-            info["source"] = str(path)
-            audio_infos.append(info)
-        result["aud_feature"] = stack_trials_3d(audio_trials)
-        result["aud_fs"] = audio_cfg.fs_out
-        result["aud_info"] = audio_infos
-
-    # EEG trials
-    eeg_trials = []
-    eeg_infos = []
-    if args.eeg:
-        for path in args.eeg:
-            eeg, fs_out, info = preprocess_eeg(path, eeg_cfg, mastoids=args.mastoids)
-            eeg_trials.append(eeg)
-            info["source"] = str(path)
-            eeg_infos.append(info)
-        result["eeg_feature"] = stack_trials_3d(eeg_trials)
-        result["eeg_fs"] = fs_out
-        result["eeg_info"] = eeg_infos
-
-    if "aud_feature" not in result and "eeg_feature" not in result:
-        raise SystemExit("Nothing to do. Provide --audio and/or --derived-envelope and/or --eeg.")
-
-    # Save NPZ
-    npz_payload = {}
-    for key, value in result.items():
-        if isinstance(value, (dict, list)):
-            npz_payload[key] = np.array(json.dumps(value), dtype=object)
-        else:
-            npz_payload[key] = value
-    np.savez(out, **npz_payload)
-
-    # Optional MATLAB export
-    if args.save_mat:
-        mat_path = out.with_suffix(".mat")
-        mat_payload = {}
-        for key, value in result.items():
-            if isinstance(value, (dict, list)):
-                mat_payload[key] = json.dumps(value)
-            else:
-                mat_payload[key] = value
-        savemat(mat_path, mat_payload, do_compression=True)
-
-    print(f"Saved: {out}")
-    if args.save_mat:
-        print(f"Saved: {out.with_suffix('.mat')}")
+    if args.mode in {"all", "example2"}:
+        out2 = data_dir / "example2_mtrf" / "preprocessed"
+        payload2 = build_example2_subject(args.bidsdir, args.subject)
+        _save_npz_and_optional_mat(out2, payload2, args.save_mat)
+        print(f"Saved: {out2.with_suffix('.npz')}")
+        if args.save_mat:
+            print(f"Saved: {out2.with_suffix('.mat')}")
 
 
 if __name__ == "__main__":
