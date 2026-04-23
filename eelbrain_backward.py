@@ -1,427 +1,370 @@
 from __future__ import annotations
 
 """
-Compute Eelbrain-ready trial objects and a backward TRF/decoder on the Fuglsang
-preprocessed dataset.
+Train a backward Eelbrain decoder on preprocessed Fuglsang-style envelope/EEG data.
 
-Supports the outputs created by:
-- data/example1/preprocessed.npz
-- data/example2_mtrf/preprocessed.npz
+Expected input
+--------------
+An .npz file created by preprocess_backward_eelbrain.py with keys:
+    stim_att : object array of shape (n_trials,), each entry (time,)
+    stim_ign : object array of shape (n_trials,), each entry (time,)
+    resp_tt  : object array of shape (n_trials,), each entry (time, channels)
+Optional:
+    stim_st, resp_st for single-talker sanity-check reconstruction
 
-Main features
--------------
-1) Load preprocessed stimulus/EEG trials.
-2) Optionally build an Eelbrain Dataset for inspection/export.
-3) Fit a backward model (EEG -> stimulus) with ridge regression and
-   leave-one-trial-out CV.
-4) Optionally perform attention classification by training on single-talker
-   trials and testing on two-talker trials.
+Main output
+-----------
+1. JSON summary with decoding accuracy and correlation metrics
+2. NPZ file with per-trial predictions and metrics
 
-The backward model is implemented explicitly with NumPy/SciPy ridge regression.
+Notes
+-----
+- Uses Eelbrain's backward model: stimulus envelope is y, EEG is x.
+- Uses test=1 cross-validation so every trial is predicted from complementary
+  training data.
+- Uses partitions = n_trials by default, which becomes leave-one-trial-out when
+  trials are represented with a Case dimension.
 """
 
 import argparse
 import json
-import pickle
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any
 
 import numpy as np
-from scipy.io import savemat
-from scipy.linalg import solve
-
-try:
-    import eelbrain as eb  # type: ignore
-    HAVE_EELBRAIN = True
-except Exception:
-    eb = None
-    HAVE_EELBRAIN = False
 
 
 @dataclass
 class DecoderConfig:
-    fs: float = 64.0
-    tmin_ms: float = 0.0
-    tmax_ms: float = 500.0
-    alpha_grid: Tuple[float, ...] = tuple(np.logspace(-3, 6, 20))
-    zscore_x: bool = True
-    zscore_y: bool = True
+    tstart: float = -0.5
+    tstop: float = 0.0
+    basis: float = 0.05
+    basis_window: str = "hamming"
+    partitions: int | None = None
+    error: str = "l2"
+    selective_stopping: int = 1
+    scale_data: bool = True
+    debug: bool = False
 
 
-def _to_list_trials_from_3d(x: np.ndarray, squeeze_last: bool = False) -> List[np.ndarray]:
-    if x.ndim != 3:
-        raise ValueError(f"Expected 3D array (time, features, trials), got shape={x.shape}")
-    trials: List[np.ndarray] = []
-    for i in range(x.shape[2]):
-        xi = np.asarray(x[:, :, i], dtype=float)
-        if squeeze_last and xi.shape[1] == 1:
-            xi = xi[:, 0]
-        trials.append(xi)
-    return trials
+@dataclass
+class TrialResult:
+    trial_index: int
+    r_att: float
+    r_ign: float
+    correct: int
 
 
-def load_preprocessed(path: str | Path, mode: str) -> Dict[str, List[np.ndarray]]:
-    path = Path(path)
-    data = np.load(path, allow_pickle=True)
-
-    if mode == "example1":
-        required = ["target_st", "target_tt", "masker_tt", "eeg_st", "eeg_tt"]
-        missing = [k for k in required if k not in data]
-        if missing:
-            raise KeyError(f"Missing keys in {path}: {missing}")
-        return {
-            "target_st": _to_list_trials_from_3d(data["target_st"], squeeze_last=True),
-            "target_tt": _to_list_trials_from_3d(data["target_tt"], squeeze_last=True),
-            "masker_tt": _to_list_trials_from_3d(data["masker_tt"], squeeze_last=True),
-            "eeg_st": _to_list_trials_from_3d(data["eeg_st"], squeeze_last=False),
-            "eeg_tt": _to_list_trials_from_3d(data["eeg_tt"], squeeze_last=False),
-        }
-
-    if mode == "example2":
-        required = ["stim_st", "resp_st", "stim_att", "stim_itt", "resp_tt"]
-        missing = [k for k in required if k not in data]
-        if missing:
-            raise KeyError(f"Missing keys in {path}: {missing}")
-
-        def _normalize_item(x: np.ndarray) -> np.ndarray:
-            x = np.asarray(x, dtype=float)
-            if x.ndim == 2 and x.shape[1] == 1:
-                return x[:, 0]
-            return x
-
-        def _to_py_list(key: str) -> List[np.ndarray]:
-            arr = data[key]
-            if arr.dtype == object:
-                return [_normalize_item(np.asarray(a)) for a in arr.tolist()]
-            return [_normalize_item(np.asarray(a)) for a in arr]
-
-        return {
-            "stim_st": _to_py_list("stim_st"),
-            "resp_st": _to_py_list("resp_st"),
-            "stim_att": _to_py_list("stim_att"),
-            "stim_itt": _to_py_list("stim_itt"),
-            "resp_tt": _to_py_list("resp_tt"),
-        }
-
-    raise ValueError(f"Unknown mode: {mode}")
-
-
-def build_eelbrain_dataset(trials: Dict[str, List[np.ndarray]], fs: float = 64.0):
-    if not HAVE_EELBRAIN:
-        raise ImportError("eelbrain is not installed in the current environment.")
-
-    ds = eb.Dataset()
-
-    def _make_ndvar_1d(x: np.ndarray, name: str):
-        time = eb.UTS(0.0, 1.0 / fs, len(x))
-        return eb.NDVar(np.asarray(x, dtype=float), (time,), name=name)
-
-    def _make_ndvar_2d(x: np.ndarray, name: str):
-        x = np.asarray(x, dtype=float)
-        time = eb.UTS(0.0, 1.0 / fs, x.shape[0])
-        chan = eb.Scalar("channel", np.arange(x.shape[1]))
-        return eb.NDVar(x.T, (chan, time), name=name)
-
-    trial_rows = []
-    if "target_st" in trials:
-        for i, (stim, eeg) in enumerate(zip(trials["target_st"], trials["eeg_st"])):
-            trial_rows.append(dict(condition="single_talker", attended=_make_ndvar_1d(stim, "stimulus"), ignored=None, eeg=_make_ndvar_2d(eeg, "eeg"), trial=i))
-        for i, (att, itt, eeg) in enumerate(zip(trials["target_tt"], trials["masker_tt"], trials["eeg_tt"])):
-            trial_rows.append(dict(condition="two_talker", attended=_make_ndvar_1d(att, "attended"), ignored=_make_ndvar_1d(itt, "ignored"), eeg=_make_ndvar_2d(eeg, "eeg"), trial=i))
-    else:
-        for i, (stim, eeg) in enumerate(zip(trials["stim_st"], trials["resp_st"])):
-            trial_rows.append(dict(condition="single_talker", attended=_make_ndvar_1d(stim, "stimulus"), ignored=None, eeg=_make_ndvar_2d(eeg, "eeg"), trial=i))
-        for i, (att, itt, eeg) in enumerate(zip(trials["stim_att"], trials["stim_itt"], trials["resp_tt"])):
-            trial_rows.append(dict(condition="two_talker", attended=_make_ndvar_1d(att, "attended"), ignored=_make_ndvar_1d(itt, "ignored"), eeg=_make_ndvar_2d(eeg, "eeg"), trial=i))
-
-        ds = eb.Dataset()
-        ds["condition"] = eb.Factor([r["condition"] for r in trial_rows])
-        ds["trial"] = eb.Var([r["trial"] for r in trial_rows])
-        ds["eeg"] = [r["eeg"] for r in trial_rows]
-        ds["attended"] = [r["attended"] for r in trial_rows]
-        ds["ignored"] = [r["ignored"] if r["ignored"] is not None else "" for r in trial_rows]
-        
-    return ds
-
-
-def ms_to_lag_samples(tmin_ms: float, tmax_ms: float, fs: float) -> np.ndarray:
-    lag_min = int(round(tmin_ms * fs / 1000.0))
-    lag_max = int(round(tmax_ms * fs / 1000.0))
-    if lag_max < lag_min:
-        raise ValueError("tmax_ms must be >= tmin_ms")
-    return np.arange(lag_min, lag_max + 1, dtype=int)
-
-
-def make_lag_matrix(eeg: np.ndarray, lags: Sequence[int]) -> np.ndarray:
-    eeg = np.asarray(eeg, dtype=float)
-    if eeg.ndim != 2:
-        raise ValueError(f"Expected eeg with shape (time, channels), got {eeg.shape}")
-    n_time, n_chan = eeg.shape
-    out = np.zeros((n_time, n_chan * len(lags)), dtype=float)
-    for i, lag in enumerate(lags):
-        block = np.zeros_like(eeg)
-        if lag == 0:
-            block[:] = eeg
-        elif lag > 0:
-            block[lag:, :] = eeg[:-lag, :]
-        else:
-            block[:lag, :] = eeg[-lag:, :]
-        out[:, i * n_chan:(i + 1) * n_chan] = block
-    return out
-
-
-def zscore_fit(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    mean = np.mean(x, axis=0, keepdims=True)
-    std = np.std(x, axis=0, ddof=0, keepdims=True)
-    std[std == 0] = 1.0
-    return mean, std
-
-
-def zscore_apply(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (x - mean) / std
-
-
-def fit_ridge_closed_form(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
-    XtX = X.T @ X
-    Xty = X.T @ y
-    reg = alpha * np.eye(X.shape[1])
-    return solve(XtX + reg, Xty, assume_a="pos")
-
-
-def corr_1d(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=float).ravel()
-    b = np.asarray(b, dtype=float).ravel()
-    if len(a) != len(b):
-        raise ValueError("Arrays must have the same length for correlation")
-    if np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    return float(np.corrcoef(a, b)[0, 1])
-
-
-def concatenate_trials(eeg_trials: Sequence[np.ndarray], stim_trials: Sequence[np.ndarray], lags: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
-    X_parts = []
-    y_parts = []
-    for eeg, stim in zip(eeg_trials, stim_trials):
-        X_parts.append(make_lag_matrix(eeg, lags))
-        y_parts.append(np.asarray(stim, dtype=float).ravel())
-    return np.vstack(X_parts), np.concatenate(y_parts)
-
-
-def backward_cv(eeg_trials: Sequence[np.ndarray], stim_trials: Sequence[np.ndarray], cfg: DecoderConfig) -> Dict[str, np.ndarray | list | float]:
-    if len(eeg_trials) != len(stim_trials):
-        raise ValueError("eeg_trials and stim_trials must have same length")
-    lags = ms_to_lag_samples(cfg.tmin_ms, cfg.tmax_ms, cfg.fs)
-    fold_corrs = []
-    fold_best_alpha = []
-    fold_yhat = []
-
-    for test_idx in range(len(eeg_trials)):
-        train_eeg = [e for i, e in enumerate(eeg_trials) if i != test_idx]
-        train_stim = [s for i, s in enumerate(stim_trials) if i != test_idx]
-        test_eeg = eeg_trials[test_idx]
-        test_stim = np.asarray(stim_trials[test_idx], dtype=float).ravel()
-
-        X_train, y_train = concatenate_trials(train_eeg, train_stim, lags)
-        X_test = make_lag_matrix(test_eeg, lags)
-
-        if cfg.zscore_x:
-            mx, sx = zscore_fit(X_train)
-            X_train = zscore_apply(X_train, mx, sx)
-            X_test = zscore_apply(X_test, mx, sx)
-
-        if cfg.zscore_y:
-            my, sy = zscore_fit(y_train[:, None])
-            y_train_z = zscore_apply(y_train[:, None], my, sy).ravel()
-        else:
-            my = np.array([[0.0]])
-            sy = np.array([[1.0]])
-            y_train_z = y_train
-
-        best_alpha = None
-        best_w = None
-        best_score = -np.inf
-        for alpha in cfg.alpha_grid:
-            w = fit_ridge_closed_form(X_train, y_train_z, alpha)
-            yhat_z = X_test @ w
-            yhat = (yhat_z * sy.ravel()[0]) + my.ravel()[0]
-            score = corr_1d(yhat, test_stim)
-            if np.isfinite(score) and score > best_score:
-                best_score = score
-                best_alpha = alpha
-                best_w = w
-
-        assert best_w is not None and best_alpha is not None
-        yhat_z = X_test @ best_w
-        yhat = (yhat_z * sy.ravel()[0]) + my.ravel()[0]
-        fold_corrs.append(best_score)
-        fold_best_alpha.append(best_alpha)
-        fold_yhat.append(yhat)
-
-    return {
-        "lags_samples": np.asarray(lags, dtype=int),
-        "lags_ms": np.asarray(lags, dtype=float) * (1000.0 / cfg.fs),
-        "fold_corrs": np.asarray(fold_corrs, dtype=float),
-        "mean_corr": float(np.nanmean(fold_corrs)),
-        "best_alpha_per_fold": np.asarray(fold_best_alpha, dtype=float),
-        "predictions": fold_yhat,
-    }
-
-
-def attention_classification_from_single_talker(eeg_st: Sequence[np.ndarray], stim_st: Sequence[np.ndarray], eeg_tt: Sequence[np.ndarray], stim_att: Sequence[np.ndarray], stim_itt: Sequence[np.ndarray], cfg: DecoderConfig) -> Dict[str, np.ndarray | float]:
-    lags = ms_to_lag_samples(cfg.tmin_ms, cfg.tmax_ms, cfg.fs)
-    X_train, y_train = concatenate_trials(eeg_st, stim_st, lags)
-
-    if cfg.zscore_x:
-        mx, sx = zscore_fit(X_train)
-        X_train = zscore_apply(X_train, mx, sx)
-    else:
-        mx, sx = None, None
-
-    if cfg.zscore_y:
-        my, sy = zscore_fit(y_train[:, None])
-        y_train_z = zscore_apply(y_train[:, None], my, sy).ravel()
-    else:
-        my = np.array([[0.0]])
-        sy = np.array([[1.0]])
-        y_train_z = y_train
-
-    best_alpha = None
-    best_w = None
-    best_score = -np.inf
-    for alpha in cfg.alpha_grid:
-        w = fit_ridge_closed_form(X_train, y_train_z, alpha)
-        yhat_train_z = X_train @ w
-        yhat_train = (yhat_train_z * sy.ravel()[0]) + my.ravel()[0]
-        score = corr_1d(yhat_train, y_train)
-        if np.isfinite(score) and score > best_score:
-            best_score = score
-            best_alpha = alpha
-            best_w = w
-
-    assert best_w is not None and best_alpha is not None
-
-    corr_att = []
-    corr_itt = []
-    pred_attended = []
-
-    for eeg, att, itt in zip(eeg_tt, stim_att, stim_itt):
-        X = make_lag_matrix(eeg, lags)
-        if mx is not None and sx is not None:
-            X = zscore_apply(X, mx, sx)
-        yhat_z = X @ best_w
-        yhat = (yhat_z * sy.ravel()[0]) + my.ravel()[0]
-        r_att = corr_1d(yhat, att)
-        r_itt = corr_1d(yhat, itt)
-        pred_attended.append(int(r_att >= r_itt))
-        corr_att.append(r_att)
-        corr_itt.append(r_itt)
-
-    return {
-        "best_alpha": float(best_alpha),
-        "corr_att": np.asarray(corr_att, dtype=float),
-        "corr_itt": np.asarray(corr_itt, dtype=float),
-        "pred_attended": np.asarray(pred_attended, dtype=int),
-        "accuracy": float(np.mean(pred_attended)),
-    }
-
-
-def save_results(outdir: Path, stem: str, results: Dict):
-    outdir.mkdir(parents=True, exist_ok=True)
-    summary = {}
-    for k, v in results.items():
-        if isinstance(v, np.ndarray):
-            summary[k] = v.tolist()
-        elif isinstance(v, list):
-            summary[k] = [vv.tolist() if isinstance(vv, np.ndarray) else vv for vv in v]
-        else:
-            summary[k] = v
-    with open(outdir / f"{stem}.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    mat_payload = {}
-    for k, v in results.items():
-        if isinstance(v, np.ndarray):
-            mat_payload[k] = v
-        elif isinstance(v, list):
-            try:
-                mat_payload[k] = np.array(v, dtype=object)
-            except Exception:
-                pass
-        elif isinstance(v, (int, float, np.integer, np.floating)):
-            mat_payload[k] = np.array([v])
-    savemat(outdir / f"{stem}.mat", mat_payload)
-
-    with open(outdir / f"{stem}.pkl", "wb") as f:
-        pickle.dump(results, f)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Compute Eelbrain-ready data objects and a backward model on Fuglsang preprocessed data.")
-    p.add_argument("--input", required=True, help="Path to preprocessed.npz")
-    p.add_argument("--mode", choices=["example1", "example2"], required=True, help="Which preprocessed format to load")
-    p.add_argument("--outdir", default="./results_backward", help="Directory for outputs")
-    p.add_argument("--tmin-ms", type=float, default=0.0, help="Minimum lag in ms")
-    p.add_argument("--tmax-ms", type=float, default=500.0, help="Maximum lag in ms")
-    p.add_argument("--fs", type=float, default=64.0, help="Sampling rate after preprocessing")
-    p.add_argument("--classify", action="store_true", help="Also run train-on-single-talker attention classification")
-    p.add_argument("--save-eelbrain", action="store_true", help="Save an Eelbrain Dataset pickle if eelbrain is installed")
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Backward Eelbrain decoding from preprocessed .npz data")
+    p.add_argument("--input", type=Path, required=True, help="Path to preprocessed .npz file")
+    p.add_argument("--outdir", type=Path, required=True, help="Directory for result files")
+    p.add_argument("--tstart", type=float, default=-0.5, help="Decoder lag-window start in seconds")
+    p.add_argument("--tstop", type=float, default=0.0, help="Decoder lag-window stop in seconds")
+    p.add_argument("--basis", type=float, default=0.05, help="Basis window length in seconds")
+    p.add_argument("--basis-window", default="hamming", help="Basis window type for eelbrain.boosting")
+    p.add_argument("--partitions", type=int, default=None, help="Cross-validation partitions (default: n_trials)")
+    p.add_argument("--error", choices=["l1", "l2"], default="l2")
+    p.add_argument("--selective-stopping", type=int, default=1)
+    p.add_argument("--no-scale-data", action="store_true", help="Disable eelbrain input normalization")
+    p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    outdir = Path(args.outdir)
-    cfg = DecoderConfig(fs=args.fs, tmin_ms=args.tmin_ms, tmax_ms=args.tmax_ms)
-    trials = load_preprocessed(args.input, args.mode)
+def _pearsonr(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    if x.size != y.size:
+        raise ValueError(f"Correlation inputs must have same length, got {x.size} and {y.size}")
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = np.sqrt(np.sum(x * x) * np.sum(y * y))
+    if denom == 0:
+        return float("nan")
+    return float(np.sum(x * y) / denom)
 
-    if args.save_eelbrain:
-        if not HAVE_EELBRAIN:
-            print("eelbrain is not installed; skipping Eelbrain Dataset export.")
+
+def _safe_float(x: Any) -> float | None:
+    try:
+        xf = float(x)
+    except Exception:
+        return None
+    if np.isnan(xf) or np.isinf(xf):
+        return None
+    return xf
+
+
+def _load_json_scalar(arr: np.ndarray | Any) -> Any:
+    if isinstance(arr, np.ndarray) and arr.shape == ():
+        arr = arr.item()
+    if isinstance(arr, bytes):
+        arr = arr.decode("utf-8")
+    if isinstance(arr, str):
+        try:
+            return json.loads(arr)
+        except json.JSONDecodeError:
+            return arr
+    return arr
+
+
+def _stack_trials_1d(trials: np.ndarray) -> np.ndarray:
+    return np.stack([np.asarray(t, dtype=np.float64).ravel() for t in trials], axis=0)
+
+
+def _stack_trials_2d(trials: np.ndarray) -> np.ndarray:
+    return np.stack([np.asarray(t, dtype=np.float64) for t in trials], axis=0)
+
+
+def _import_eelbrain():
+    try:
+        import eelbrain as eb
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not import eelbrain. Activate your eelbrain environment first, "
+            "for example: conda activate eelbrain"
+        ) from exc
+    return eb
+
+
+def _make_ndvars(eb, stim_att: np.ndarray, stim_ign: np.ndarray, resp_tt: np.ndarray, fs: float):
+    n_trials, n_time = stim_att.shape
+    n_channels = resp_tt.shape[2]
+
+    time = eb.UTS(0.0, 1.0 / fs, n_time)
+    sensor = eb.Categorial("sensor", [f"ch{i+1:02d}" for i in range(n_channels)])
+
+    y_att = eb.NDVar(stim_att, (eb.Case, time), name="stim_att")
+    y_ign = eb.NDVar(stim_ign, (eb.Case, time), name="stim_ign")
+    x_eeg = eb.NDVar(resp_tt, (eb.Case, time, sensor), name="eeg")
+    return y_att, y_ign, x_eeg
+
+
+def _train_backward_cv(eb, y_att, x_eeg, cfg: DecoderConfig):
+    n_trials = y_att.x.shape[0]
+    partitions = cfg.partitions or n_trials
+    if partitions < 2:
+        raise ValueError("Need at least 2 partitions/trials for cross-validation")
+    if partitions > n_trials:
+        raise ValueError(f"partitions={partitions} exceeds number of trials={n_trials}")
+
+    return eb.boosting(
+        y_att,
+        x_eeg,
+        cfg.tstart,
+        cfg.tstop,
+        basis=cfg.basis,
+        basis_window=cfg.basis_window,
+        partitions=partitions,
+        test=1,
+        error=cfg.error,
+        selective_stopping=cfg.selective_stopping,
+        scale_data=cfg.scale_data,
+        partition_results=True,
+        debug=cfg.debug,
+    )
+
+
+def _get_y_pred(result, x_ndvar) -> np.ndarray:
+    """Get cross-validated predictions robustly across Eelbrain versions."""
+    y_pred_obj = getattr(result, "y_pred", None)
+    if y_pred_obj is not None and getattr(y_pred_obj, "x", None) is not None:
+        return np.asarray(y_pred_obj.x, dtype=np.float64)
+
+    # Supported/documented path in Eelbrain for CV predictions
+    y_pred_obj = result.cross_predict(x_ndvar, scale="original")
+    return np.asarray(y_pred_obj.x, dtype=np.float64)
+
+
+def _summarize_decoder(result, x_eeg, stim_att: np.ndarray, stim_ign: np.ndarray):
+    y_pred = _get_y_pred(result, x_eeg)
+
+    if y_pred.shape != stim_att.shape:
+        raise RuntimeError(f"Prediction shape mismatch: {y_pred.shape=} but {stim_att.shape=}")
+
+    trial_results: list[TrialResult] = []
+    for i in range(y_pred.shape[0]):
+        r_att = _pearsonr(y_pred[i], stim_att[i])
+        r_ign = _pearsonr(y_pred[i], stim_ign[i])
+        correct = int(r_att > r_ign)
+        trial_results.append(TrialResult(i, r_att, r_ign, correct))
+
+    r_att_vals = np.array([tr.r_att for tr in trial_results], dtype=float)
+    r_ign_vals = np.array([tr.r_ign for tr in trial_results], dtype=float)
+    correct_vals = np.array([tr.correct for tr in trial_results], dtype=float)
+
+    proportion_explained = getattr(result, "proportion_explained", None)
+    if proportion_explained is None:
+        l2_total = _safe_float(getattr(result, "l2_total", np.nan))
+        l2_residual = _safe_float(getattr(result, "l2_residual", np.nan))
+        if l2_total in (None, 0.0) or l2_residual is None:
+            prop_explained = None
         else:
-            ds = build_eelbrain_dataset(trials, fs=args.fs)
-            outdir.mkdir(parents=True, exist_ok=True)
-            with open(outdir / "eelbrain_dataset.pkl", "wb") as f:
-                pickle.dump(ds, f)
-            print(f"Saved Eelbrain Dataset to: {outdir / 'eelbrain_dataset.pkl'}")
-
-    if args.mode == "example1":
-        res_st = backward_cv(trials["eeg_st"], trials["target_st"], cfg)
-        save_results(outdir, "backward_cv_single_talker", res_st)
-        print(f"Single-talker mean reconstruction correlation: {res_st['mean_corr']:.4f}")
-
-        res_att = backward_cv(trials["eeg_tt"], trials["target_tt"], cfg)
-        save_results(outdir, "backward_cv_two_talker_attended", res_att)
-        print(f"Two-talker attended mean reconstruction correlation: {res_att['mean_corr']:.4f}")
-
-        res_itt = backward_cv(trials["eeg_tt"], trials["masker_tt"], cfg)
-        save_results(outdir, "backward_cv_two_talker_ignored", res_itt)
-        print(f"Two-talker ignored mean reconstruction correlation: {res_itt['mean_corr']:.4f}")
-
-        if args.classify:
-            cls = attention_classification_from_single_talker(eeg_st=trials["eeg_st"], stim_st=trials["target_st"], eeg_tt=trials["eeg_tt"], stim_att=trials["target_tt"], stim_itt=trials["masker_tt"], cfg=cfg)
-            save_results(outdir, "attention_classification", cls)
-            print(f"Attention classification accuracy: {cls['accuracy']:.4f}")
-
+            prop_explained = 1.0 - (l2_residual / l2_total)
     else:
-        res_st = backward_cv(trials["resp_st"], trials["stim_st"], cfg)
-        save_results(outdir, "backward_cv_single_talker", res_st)
-        print(f"Single-talker mean reconstruction correlation: {res_st['mean_corr']:.4f}")
+        prop_explained = _safe_float(proportion_explained)
 
-        res_att = backward_cv(trials["resp_tt"], trials["stim_att"], cfg)
-        save_results(outdir, "backward_cv_two_talker_attended", res_att)
-        print(f"Two-talker attended mean reconstruction correlation: {res_att['mean_corr']:.4f}")
+    summary = {
+        "n_trials": int(len(trial_results)),
+        "mean_r_att": float(np.nanmean(r_att_vals)),
+        "mean_r_ign": float(np.nanmean(r_ign_vals)),
+        "median_r_att": float(np.nanmedian(r_att_vals)),
+        "median_r_ign": float(np.nanmedian(r_ign_vals)),
+        "decoding_accuracy": float(np.nanmean(correct_vals)),
+        "n_correct": int(np.nansum(correct_vals)),
+        "eelbrain_r": _safe_float(getattr(result, "r", np.nan)),
+        "eelbrain_r_rank": _safe_float(getattr(result, "r_rank", np.nan)),
+        "proportion_explained": prop_explained,
+        "l1_residual": _safe_float(getattr(result, "l1_residual", np.nan)),
+        "l1_total": _safe_float(getattr(result, "l1_total", np.nan)),
+        "l2_residual": _safe_float(getattr(result, "l2_residual", np.nan)),
+        "l2_total": _safe_float(getattr(result, "l2_total", np.nan)),
+    }
+    return trial_results, summary, y_pred
 
-        res_itt = backward_cv(trials["resp_tt"], trials["stim_itt"], cfg)
-        save_results(outdir, "backward_cv_two_talker_ignored", res_itt)
-        print(f"Two-talker ignored mean reconstruction correlation: {res_itt['mean_corr']:.4f}")
 
-        if args.classify:
-            cls = attention_classification_from_single_talker(eeg_st=trials["resp_st"], stim_st=trials["stim_st"], eeg_tt=trials["resp_tt"], stim_att=trials["stim_att"], stim_itt=trials["stim_itt"], cfg=cfg)
-            save_results(outdir, "attention_classification", cls)
-            print(f"Attention classification accuracy: {cls['accuracy']:.4f}")
+def _single_talker_summary(eb, stim_st: np.ndarray, resp_st: np.ndarray, fs: float, cfg: DecoderConfig) -> dict[str, Any] | None:
+    if stim_st.size == 0 or resp_st.size == 0:
+        return None
+    if stim_st.shape[0] < 2:
+        return None
+    if not (stim_st.shape[0] == resp_st.shape[0] and stim_st.shape[1] == resp_st.shape[1]):
+        return None
 
-    print(f"Saved outputs to: {outdir.resolve()}")
+    time = eb.UTS(0.0, 1.0 / fs, stim_st.shape[1])
+    sensor = eb.Categorial("sensor", [f"ch{i+1:02d}" for i in range(resp_st.shape[2])])
+    y_st = eb.NDVar(stim_st, (eb.Case, time), name="stim_st")
+    x_st = eb.NDVar(resp_st, (eb.Case, time, sensor), name="resp_st")
+
+    st_partitions = cfg.partitions or stim_st.shape[0]
+    st_partitions = min(max(2, st_partitions), stim_st.shape[0])
+
+    st_result = eb.boosting(
+        y_st,
+        x_st,
+        cfg.tstart,
+        cfg.tstop,
+        basis=cfg.basis,
+        basis_window=cfg.basis_window,
+        partitions=st_partitions,
+        test=1,
+        error=cfg.error,
+        selective_stopping=cfg.selective_stopping,
+        scale_data=cfg.scale_data,
+        partition_results=True,
+        debug=cfg.debug,
+    )
+
+    y_st_pred = _get_y_pred(st_result, x_st)
+    r_st = np.array([_pearsonr(y_st_pred[i], stim_st[i]) for i in range(stim_st.shape[0])], dtype=float)
+
+    return {
+        "n_trials": int(stim_st.shape[0]),
+        "mean_r": float(np.nanmean(r_st)),
+        "median_r": float(np.nanmedian(r_st)),
+        "eelbrain_r": _safe_float(getattr(st_result, "r", np.nan)),
+        "eelbrain_r_rank": _safe_float(getattr(st_result, "r_rank", np.nan)),
+        "l2_residual": _safe_float(getattr(st_result, "l2_residual", np.nan)),
+        "l2_total": _safe_float(getattr(st_result, "l2_total", np.nan)),
+    }
+
+
+def main() -> None:
+    args = _parse_args()
+    cfg = DecoderConfig(
+        tstart=args.tstart,
+        tstop=args.tstop,
+        basis=args.basis,
+        basis_window=args.basis_window,
+        partitions=args.partitions,
+        error=args.error,
+        selective_stopping=args.selective_stopping,
+        scale_data=not args.no_scale_data,
+        debug=args.debug,
+    )
+
+    obj = np.load(args.input, allow_pickle=True)
+    meta = _load_json_scalar(obj["meta"]) if "meta" in obj else None
+    trial_meta = _load_json_scalar(obj["trial_meta"]) if "trial_meta" in obj else None
+    fs_stim = float(np.asarray(obj["fs_stim"]).item())
+    fs_resp = float(np.asarray(obj["fs_resp"]).item())
+
+    if not np.isclose(fs_stim, fs_resp):
+        raise ValueError(f"Stimulus and response sampling rates differ: {fs_stim} vs {fs_resp}")
+
+    stim_att = _stack_trials_1d(obj["stim_att"])
+    stim_ign = _stack_trials_1d(obj["stim_ign"])
+    resp_tt = _stack_trials_2d(obj["resp_tt"])
+
+    if not (
+        stim_att.shape == stim_ign.shape
+        and stim_att.shape[0] == resp_tt.shape[0]
+        and stim_att.shape[1] == resp_tt.shape[1]
+    ):
+        raise ValueError(
+            "Two-talker trial arrays do not align: "
+            f"stim_att {stim_att.shape}, stim_ign {stim_ign.shape}, resp_tt {resp_tt.shape}"
+        )
+
+    eb = _import_eelbrain()
+    y_att, y_ign, x_eeg = _make_ndvars(eb, stim_att, stim_ign, resp_tt, fs_stim)
+    result = _train_backward_cv(eb, y_att, x_eeg, cfg)
+    trial_results, summary, y_pred = _summarize_decoder(result, x_eeg, stim_att, stim_ign)
+
+    single_talker_summary = None
+    if "stim_st" in obj and "resp_st" in obj:
+        stim_st = _stack_trials_1d(obj["stim_st"])
+        resp_st = _stack_trials_2d(obj["resp_st"])
+        single_talker_summary = _single_talker_summary(eb, stim_st, resp_st, fs_stim, cfg)
+
+    payload = {
+        "input_file": str(args.input),
+        "fs_stim": fs_stim,
+        "fs_resp": fs_resp,
+        "decoder_config": asdict(cfg),
+        "meta": meta,
+        "summary_two_talker": summary,
+        "summary_single_talker": single_talker_summary,
+        "trial_results_two_talker": [asdict(tr) for tr in trial_results],
+        "n_channels": int(resp_tt.shape[2]),
+        "n_timepoints": int(resp_tt.shape[1]),
+        "trial_meta": trial_meta,
+    }
+
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    stem = args.input.stem
+    json_path = args.outdir / f"{stem}_backward_summary.json"
+    npz_path = args.outdir / f"{stem}_backward_predictions.npz"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    np.savez(
+        npz_path,
+        y_pred_att=y_pred,
+        stim_att=stim_att,
+        stim_ign=stim_ign,
+        resp_tt=resp_tt,
+        trial_r_att=np.array([tr.r_att for tr in trial_results], dtype=np.float64),
+        trial_r_ign=np.array([tr.r_ign for tr in trial_results], dtype=np.float64),
+        trial_correct=np.array([tr.correct for tr in trial_results], dtype=np.int64),
+        decoder_h=getattr(getattr(result, "h_scaled", None), "x", np.asarray([])),
+    )
+
+    print("Saved summary:", json_path)
+    print("Saved predictions:", npz_path)
+    print()
+    print("Two-talker summary")
+    print("------------------")
+    for key, value in summary.items():
+        print(f"{key}: {value}")
+
+    if single_talker_summary is not None:
+        print()
+        print("Single-talker sanity summary")
+        print("----------------------------")
+        for key, value in single_talker_summary.items():
+            print(f"{key}: {value}")
 
 
 if __name__ == "__main__":

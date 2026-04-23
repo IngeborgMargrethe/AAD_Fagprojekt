@@ -10,8 +10,8 @@ This version is intended for subsets like:
       participants.tsv
       sub-004/eeg/sub-004_task-selectiveattention_eeg.bdf
       sub-004/eeg/sub-004_task-selectiveattention_events.tsv
-      stimuli/sub004/target/*.mat
-      stimuli/sub004/masker/*.mat
+      stimuli_audio/sub004/target/*.mat
+      stimuli_audio/sub004/masker/*.mat
 
 Important limitation
 --------------------
@@ -19,7 +19,7 @@ The original examplescript1 MATLAB pipeline starts from raw audio and applies a
 full auditory-model front-end. If the subset only contains .mat stimulus files,
 this Python script instead assumes those MAT files already contain a derived
 stimulus representation (typically an envelope-like feature at 512 Hz). It then
-applies the *later* stages of the Fuglsang pipeline:
+applies the later stages of the Fuglsang pipeline:
     lowpass 30 Hz -> resample 64 Hz -> highpass 1 Hz -> lowpass 9 Hz
 and aligns the result to preprocessed EEG.
 """
@@ -28,7 +28,7 @@ import argparse
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import mne
 import numpy as np
@@ -41,7 +41,15 @@ def _as_float64(x: np.ndarray) -> np.ndarray:
     return np.asarray(x, dtype=np.float64)
 
 
-def _butter_filter(x: np.ndarray, fs: float, *, low: float | None = None, high: float | None = None, order: int = 4, axis: int = 0) -> np.ndarray:
+def _butter_filter(
+    x: np.ndarray,
+    fs: float,
+    *,
+    low: float | None = None,
+    high: float | None = None,
+    order: int = 4,
+    axis: int = 0,
+) -> np.ndarray:
     nyq = fs / 2.0
     if low is not None and high is not None:
         wn = [low / nyq, high / nyq]
@@ -104,15 +112,21 @@ def _jsonable(obj: Any) -> Any:
     return str(obj)
 
 
-def load_numeric_feature_from_mat(path):
-    """Load the most plausible numeric timeseries from a MAT file.
+def load_numeric_feature_from_mat(path: Path):
+    """
+    Load the most plausible numeric timeseries from a MAT file.
 
-    Heuristic approach because the exact variable names in the subset may vary.
-    Returns a 1D feature vector, an inferred sampling rate, and metadata.
+    Returns
+    -------
+    feat : np.ndarray
+        2D array shaped (time, features)
+    fs_val : float | None
+        Sampling rate if present
+    info : dict
+        Metadata about how the feature was extracted
     """
     mat = loadmat(path, squeeze_me=False, struct_as_record=False)
 
-    # Case 1: your actual dataset structure
     if "dat" in mat:
         dat = mat["dat"]
         if isinstance(dat, np.ndarray) and dat.size > 0:
@@ -132,10 +146,7 @@ def load_numeric_feature_from_mat(path):
                 elif feat.ndim == 2 and feat.shape[0] < feat.shape[1]:
                     feat = feat.T
 
-                if fs is None:
-                    fs_val = None
-                else:
-                    fs_val = float(np.asarray(fs).squeeze())
+                fs_val = None if fs is None else float(np.asarray(fs).squeeze())
 
                 info = {
                     "source_key": "dat.feat",
@@ -145,7 +156,6 @@ def load_numeric_feature_from_mat(path):
                 }
                 return feat, fs_val, info
 
-    # Fallback: search for top-level numeric arrays
     for key, value in mat.items():
         if key.startswith("__"):
             continue
@@ -155,48 +165,25 @@ def load_numeric_feature_from_mat(path):
                 arr = arr[:, None]
             elif arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
                 arr = arr.T
-            info = {"source_key": key, "fs_key": None, "t_key": None, "shape": arr.shape}
+            info = {
+                "source_key": key,
+                "fs_key": None,
+                "t_key": None,
+                "shape": arr.shape,
+            }
             return arr, None, info
 
     raise ValueError(f"No usable numeric feature found in {path}")
 
-    # Prefer 1D vectors, then longer arrays, then arrays with small feature dim.
-    def score(item: tuple[str, np.ndarray]) -> tuple[int, int, int]:
-        _, arr = item
-        ndim_pref = 0 if arr.ndim == 1 else 1
-        small_second = min(arr.shape) if arr.ndim >= 2 else 1
-        return (ndim_pref, -arr.size, small_second)
 
-    key, arr = sorted(candidates, key=score)[0]
-    arr = _as_float64(arr)
+def preprocess_derived_stimulus(
+    feature: np.ndarray,
+    fs_in: float | None,
+    cfg: DerivedStimulusConfig,
+) -> np.ndarray:
+    if fs_in is None:
+        fs_in = cfg.fs_in_default
 
-    if arr.ndim == 0:
-        raise ValueError(f"Selected scalar from {path}, cannot use as timeseries")
-    if arr.ndim == 1:
-        feat = arr
-    else:
-        # Time x features or features x time -> average over feature axis.
-        if arr.shape[0] >= arr.shape[-1]:
-            feat = arr.mean(axis=tuple(range(1, arr.ndim)))
-        else:
-            feat = arr.mean(axis=tuple(range(0, arr.ndim - 1)))
-        feat = np.ravel(feat)
-
-    fs = None
-    for fs_key in ["fs", "Fs", "fsample", "sampling_frequency", "srate"]:
-        if fs_key in mat:
-            try:
-                fs = float(np.asarray(mat[fs_key]).squeeze())
-                break
-            except Exception:
-                pass
-    if fs is None:
-        fs = 512.0
-
-    return feat, fs, {"mat_key": key, "inferred_fs": fs, "path": str(path)}
-
-
-def preprocess_derived_stimulus(feature: np.ndarray, fs_in: float, cfg: DerivedStimulusConfig) -> np.ndarray:
     x = _as_float64(feature).ravel()
     x = _butter_filter(x, fs_in, high=cfg.lp_pre, order=cfg.filt_order)
     x = _resample(x, fs_in, cfg.fs_out)
@@ -214,8 +201,10 @@ def crop_toi_1d(x: np.ndarray, fs: float, tmin: float, tmax: float) -> np.ndarra
 def preprocess_eeg_bdf(bdf_path: Path, cfg: EEGConfig) -> tuple[mne.io.BaseRaw, dict[str, Any]]:
     raw = mne.io.read_raw_bdf(bdf_path, preload=True, verbose="ERROR")
     ch_names = set(raw.ch_names)
+
     if all(ch in ch_names for ch in cfg.mastoids):
         raw.set_eeg_reference(ref_channels=list(cfg.mastoids), verbose="ERROR")
+
     raw.filter(l_freq=None, h_freq=cfg.fs_lowpass, verbose="ERROR")
     raw.resample(cfg.fs_out, verbose="ERROR")
 
@@ -236,14 +225,23 @@ def preprocess_eeg_bdf(bdf_path: Path, cfg: EEGConfig) -> tuple[mne.io.BaseRaw, 
     raw.filter(l_freq=None, h_freq=cfg.lp_out, verbose="ERROR")
 
     if cfg.scalp_only:
-        keep = [ch for ch in raw.ch_names if ch.upper().startswith(("FP", "AF", "F", "FC", "C", "CP", "P", "PO", "O", "FT", "TP", "T", "CZ", "PZ", "OZ", "FZ")) and "EXG" not in ch.upper()]
+        keep = [
+            ch for ch in raw.ch_names
+            if ch.upper().startswith(
+                ("FP", "AF", "F", "FC", "C", "CP", "P", "PO", "O", "FT", "TP", "T", "CZ", "PZ", "OZ", "FZ")
+            ) and "EXG" not in ch.upper()
+        ]
         if keep:
             raw.pick(keep)
 
-    return raw, {"n_channels": len(raw.ch_names), "fs": raw.info["sfreq"], "channels": raw.ch_names}
+    return raw, {
+        "n_channels": len(raw.ch_names),
+        "fs": raw.info["sfreq"],
+        "channels": raw.ch_names,
+    }
 
 
-def events_target_table(events_path: Path) -> pd.DataFrame:
+def events_target_table(events_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     ev = pd.read_csv(events_path, sep="\t")
     if "trigger_type" not in ev.columns:
         raise ValueError(f"No trigger_type column in {events_path}")
@@ -257,6 +255,7 @@ def extract_eeg_trials(raw: mne.io.BaseRaw, target_events: pd.DataFrame, cfg: EE
     fs = raw.info["sfreq"]
     data = raw.get_data().T
     trials: list[np.ndarray] = []
+
     for _, row in target_events.iterrows():
         sample = int(round(float(row["sample"]) * (fs / 512.0))) if fs != 512.0 else int(row["sample"])
         start = sample - int(round(5 * fs))
@@ -266,23 +265,30 @@ def extract_eeg_trials(raw: mne.io.BaseRaw, target_events: pd.DataFrame, cfg: EE
         trial = data[start:stop]
         trial = crop_toi_1d(trial, fs, cfg.crop_tmin, cfg.crop_tmax)
         trials.append(trial)
+
     return trials
 
 
 def _subject_variants(subject: int | str) -> list[str]:
     s = str(subject)
-    digits = ''.join(ch for ch in s if ch.isdigit())
+    digits = "".join(ch for ch in s if ch.isdigit())
     n = int(digits)
     return [f"sub-{n:03d}", f"sub{n:03d}", f"sub-{n}", f"sub{n}"]
 
 
-def resolve_stimulus_path(bidsdir: Path, subject: int, stim_value: str, trigger_type: str, hearing_status: str | None) -> Path:
+def resolve_stimulus_path(
+    bidsdir: Path,
+    subject: int,
+    stim_value: str,
+    trigger_type: str,
+    hearing_status: str | None,
+) -> Path:
     stim_value = str(stim_value)
     stem = Path(stim_value).stem
     folder = "target" if trigger_type == "targetonset" else "masker"
-    subject_dirs = [bidsdir / "stimuli" / v / folder for v in _subject_variants(subject)]
-    candidates = []
-    prefer_woa = hearing_status is not None and str(hearing_status).lower() != "nh"
+    subject_dirs = [bidsdir / "stimuli_audio" / v / folder for v in _subject_variants(subject)]
+
+    prefer_woa = False
 
     base_names = [stem]
     if stem.endswith("woa"):
@@ -295,7 +301,7 @@ def resolve_stimulus_path(bidsdir: Path, subject: int, stim_value: str, trigger_
         if prefer_woa and not name.endswith("woa"):
             ordered.append(name + "woa")
         ordered.append(name)
-    # unique preserve order
+
     seen = set()
     ordered = [x for x in ordered if not (x in seen or seen.add(x))]
 
@@ -310,19 +316,31 @@ def resolve_stimulus_path(bidsdir: Path, subject: int, stim_value: str, trigger_
                 hits = [h for h in hits if h.suffix.lower() in {".mat", ".wav"}]
                 if hits:
                     return hits[0]
-    raise FileNotFoundError(f"Could not resolve stimulus file for {stim_value} ({trigger_type}) under stimuli/subXXX/{folder}")
+
+    raise FileNotFoundError(
+        f"Could not resolve stimulus file for {stim_value} ({trigger_type}) under stimuli_audio/subXXX/{folder}"
+    )
 
 
-def collect_trial_specs(bidsdir: Path, subject: int, events_path: Path, hearing_status: str | None) -> list[dict[str, Any]]:
+def collect_trial_specs(
+    bidsdir: Path,
+    subject: int,
+    events_path: Path,
+    hearing_status: str | None,
+) -> list[dict[str, Any]]:
     ev = pd.read_csv(events_path, sep="\t")
     rows = ev.loc[ev["trigger_type"].astype(str).isin(["targetonset", "maskeronset"])].copy()
+
     specs: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+
     for _, row in rows.iterrows():
         trig = str(row["trigger_type"])
+
         if trig == "targetonset":
             if current is not None:
                 specs.append(current)
+
             current = {
                 "target_path": resolve_stimulus_path(bidsdir, subject, row["stim_file"], trig, hearing_status),
                 "masker_path": None,
@@ -331,6 +349,7 @@ def collect_trial_specs(bidsdir: Path, subject: int, events_path: Path, hearing_
                 "target_onset_sec": float(row.get("onset", np.nan)),
                 "target_row": row.to_dict(),
             }
+
         elif trig == "maskeronset" and current is not None:
             current["masker_path"] = resolve_stimulus_path(bidsdir, subject, row["stim_file"], trig, hearing_status)
             try:
@@ -338,8 +357,10 @@ def collect_trial_specs(bidsdir: Path, subject: int, events_path: Path, hearing_
             except Exception:
                 current["masker_delay_sec"] = 0.0
             current["masker_row"] = row.to_dict()
+
     if current is not None:
         specs.append(current)
+
     return specs
 
 
@@ -356,11 +377,16 @@ def stack_trials_3d(trials: list[np.ndarray]) -> np.ndarray:
     return np.stack(arrs, axis=2)
 
 
-def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig, eeg_cfg: EEGConfig) -> dict[str, Any]:
+def process_subject(
+    bidsdir: Path,
+    subject: int,
+    stim_cfg: DerivedStimulusConfig,
+    eeg_cfg: EEGConfig,
+) -> dict[str, Any]:
     sub = f"sub-{subject:03d}"
-    participants = None
     pfile = bidsdir / "participants.tsv"
     hearing_status = None
+
     if pfile.exists():
         participants = pd.read_csv(pfile, sep="\t")
         if "participant_id" in participants.columns and "hearing_status" in participants.columns:
@@ -368,10 +394,25 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
             if len(row):
                 hearing_status = row.iloc[0]["hearing_status"]
 
+    print(f"\nProcessing subject: {sub}")
+    print(f"hearing_status = {hearing_status}")
+
     eeg_dir = bidsdir / sub / "eeg"
-    run_specs = [(eeg_dir / f"{sub}_task-selectiveattention_eeg.bdf", eeg_dir / f"{sub}_task-selectiveattention_events.tsv")]
-    if (eeg_dir / f"{sub}_task-selectiveattention_run-2_eeg.bdf").exists() and (eeg_dir / f"{sub}_task-selectiveattention_run-2_events.tsv").exists():
-        run_specs.append((eeg_dir / f"{sub}_task-selectiveattention_run-2_eeg.bdf", eeg_dir / f"{sub}_task-selectiveattention_run-2_events.tsv"))
+    run_specs = [
+        (eeg_dir / f"{sub}_task-selectiveattention_eeg.bdf",
+         eeg_dir / f"{sub}_task-selectiveattention_events.tsv")
+    ]
+
+    if (
+        (eeg_dir / f"{sub}_task-selectiveattention_run-2_eeg.bdf").exists()
+        and (eeg_dir / f"{sub}_task-selectiveattention_run-2_events.tsv").exists()
+    ):
+        run_specs.append(
+            (
+                eeg_dir / f"{sub}_task-selectiveattention_run-2_eeg.bdf",
+                eeg_dir / f"{sub}_task-selectiveattention_run-2_events.tsv",
+            )
+        )
 
     target_st_trials = []
     target_tt_trials = []
@@ -385,13 +426,39 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
         _, target_events = events_target_table(events_path)
         eeg_trials = extract_eeg_trials(raw, target_events, eeg_cfg)
         stim_specs = collect_trial_specs(bidsdir, subject, events_path, hearing_status)
-        n = min(len(eeg_trials), len(stim_specs))
+
+        print(f"\nRun: {bdf_path.name}")
+        print(f"events file: {events_path.name}")
+        print(f"len(eeg_trials) = {len(eeg_trials)}")
+        print(f"len(stim_specs) = {len(stim_specs)}")
+
+        if len(eeg_trials) != len(stim_specs):
+            raise RuntimeError(
+                f"Mismatch between EEG trials and stimulus specs: "
+                f"{len(eeg_trials)=}, {len(stim_specs)=} for {events_path}"
+            )
+
+        n = len(eeg_trials)
         if n == 0:
             continue
-        for eeg_trial, spec in zip(eeg_trials[:n], stim_specs[:n]):
+
+        for trial_idx, (eeg_trial, spec) in enumerate(zip(eeg_trials, stim_specs), start=1):
+            print(
+                f"Trial {trial_idx:02d}: "
+                f"kind={spec['single_talker_two_talker']}, "
+                f"target={Path(spec['target_path']).name}, "
+                f"masker={None if spec['masker_path'] is None else Path(spec['masker_path']).name}, "
+                f"delay={spec['masker_delay_sec']}"
+            )
+            print(
+                f"          event_target={spec['target_row'].get('stim_file')}, "
+                f"event_masker={None if 'masker_row' not in spec else spec['masker_row'].get('stim_file')}"
+            )
+
             tgt_raw, fs_t, tgt_info = load_numeric_feature_from_mat(spec["target_path"])
             tgt = preprocess_derived_stimulus(tgt_raw, fs_t, stim_cfg)
             tgt = crop_toi_1d(tgt, stim_cfg.fs_out, eeg_cfg.crop_tmin, eeg_cfg.crop_tmax)
+
             msk = None
             msk_info = None
             if spec["masker_path"] is not None:
@@ -402,12 +469,22 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
                     if pad > 0:
                         msk = np.concatenate([np.zeros(pad), msk])
                 msk = crop_toi_1d(msk, stim_cfg.fs_out, eeg_cfg.crop_tmin, eeg_cfg.crop_tmax)
+
             lengths = [len(tgt), eeg_trial.shape[0]] + ([len(msk)] if msk is not None else [])
             L = min(lengths)
+
+            print(
+                f"          len_target={len(tgt)}, "
+                f"len_masker={None if msk is None else len(msk)}, "
+                f"len_eeg={eeg_trial.shape[0]}, "
+                f"aligned={L}"
+            )
+
             tgt = tgt[:L]
             eeg_trial = eeg_trial[:L]
             if msk is not None:
                 msk = msk[:L]
+
             if msk is None:
                 target_st_trials.append(tgt)
                 eeg_st_trials.append(eeg_trial)
@@ -417,6 +494,7 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
                 masker_tt_trials.append(msk)
                 eeg_tt_trials.append(eeg_trial)
                 kind = "twotalker"
+
             trial_meta.append({
                 "run_bdf": str(bdf_path),
                 "events_path": str(events_path),
@@ -428,6 +506,10 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
                 "target_info": tgt_info,
                 "masker_info": msk_info,
                 "eeg_meta": eeg_meta,
+                "attend_left_right": spec["target_row"].get("attend_left_right"),
+                "single_talker_two_talker": spec["target_row"].get("single_talker_two_talker"),
+                "stim_file_target_event": spec["target_row"].get("stim_file"),
+                "stim_file_masker_event": None if "masker_row" not in spec else spec["masker_row"].get("stim_file"),
             })
 
     return {
@@ -455,7 +537,9 @@ def process_subject(bidsdir: Path, subject: int, stim_cfg: DerivedStimulusConfig
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Preprocess Fuglsang data from MAT stimulus derivatives into srdat-like arrays")
+    p = argparse.ArgumentParser(
+        description="Preprocess Fuglsang data from MAT stimulus derivatives into srdat-like arrays"
+    )
     p.add_argument("--bidsdir", type=Path, required=True)
     p.add_argument("--subject", type=int, required=True)
     p.add_argument("--out", type=Path, required=True)
@@ -467,10 +551,22 @@ def main() -> None:
     args = parse_args()
     payload = process_subject(args.bidsdir, args.subject, DerivedStimulusConfig(), EEGConfig())
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(args.out, **{k: (np.array(json.dumps(_jsonable(v)), dtype=object) if isinstance(v, (dict, list)) else v) for k, v in payload.items()})
-    print(f"Saved {args.out}")
+
+    np.savez(
+        args.out,
+        **{
+            k: (np.array(json.dumps(_jsonable(v)), dtype=object) if isinstance(v, (dict, list)) else v)
+            for k, v in payload.items()
+        },
+    )
+    print(f"\nSaved {args.out}")
+
     if args.save_mat:
-        savemat(args.out.with_suffix('.mat'), {k: (json.dumps(_jsonable(v)) if isinstance(v, (dict, list)) else v) for k, v in payload.items()}, do_compression=True)
+        savemat(
+            args.out.with_suffix(".mat"),
+            {k: (json.dumps(_jsonable(v)) if isinstance(v, (dict, list)) else v) for k, v in payload.items()},
+            do_compression=True,
+        )
         print(f"Saved {args.out.with_suffix('.mat')}")
 
 
